@@ -1,0 +1,246 @@
+from dash import Dash, html, dcc, Input, Output, State, callback
+from google.cloud import vision
+import base64
+import os
+import dash_bootstrap_components as dbc
+import pandas as pd
+from datetime import datetime
+
+# Set the environment variable for Google Application Credentials
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = ''
+
+# Initialize the Dash app
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+# Global variable to store results
+scan_results = []
+
+
+def get_text_blocks(response):
+    """Extract text while preserving block structure and identifying names"""
+    blocks = []
+    names = []
+
+    for page in response.full_text_annotation.pages:
+        for block in page.blocks:
+            block_text = ""
+            for paragraph in block.paragraphs:
+                para_text = ""
+                for word in paragraph.words:
+                    word_text = ''.join([symbol.text for symbol in word.symbols])
+                    para_text += word_text + ' '
+                block_text += para_text.strip() + '\n'
+
+            if block_text.strip():
+                block_text = block_text.strip()
+                blocks.append(block_text)
+
+                # Process names
+                # Split into lines to handle each potential name separately
+                lines = block_text.split('\n')
+                for line in lines:
+                    # Skip lines containing "PRINTED NAME"
+                    if "PRINTED NAME" not in line.upper():
+                        # Clean and validate potential name
+                        cleaned_line = line.strip()
+                        # Check if line looks like a name (contains letters and spaces)
+                        if cleaned_line and any(c.isalpha() for c in cleaned_line):
+                            names.append(cleaned_line)
+
+    # Clean up names list - remove duplicates and empty strings
+    names = [name for name in names if name.strip()]
+    names = list(dict.fromkeys(names))  # Remove duplicates while preserving order
+
+    return blocks, names
+
+
+# Create the layout
+app.layout = dbc.Container([
+    html.H1("Document Scanner", className="text-center my-4"),
+
+    dbc.Card([
+        dbc.CardBody([
+            # File Upload Component
+            dcc.Upload(
+                id='upload-images',
+                children=html.Div([
+                    'Drag and Drop or ',
+                    html.A('Select Files')
+                ]),
+                style={
+                    'width': '100%',
+                    'height': '60px',
+                    'lineHeight': '60px',
+                    'borderWidth': '1px',
+                    'borderStyle': 'dashed',
+                    'borderRadius': '5px',
+                    'textAlign': 'center',
+                    'margin': '10px'
+                },
+                multiple=True
+            ),
+
+            # Progress and Status
+            html.Div(id='processing-status'),
+            dcc.Loading(
+                id="loading",
+                children=[html.Div(id='output-container')],
+                type="circle",
+            ),
+        ])
+    ]),
+
+    # Results Display with Export Button
+    dbc.Card([
+        dbc.CardBody([
+            html.Div([
+                html.H4("Scan Results", className="card-title d-inline"),
+                html.Button(
+                    "Export to CSV",
+                    id="export-button",
+                    className="btn btn-primary float-right ml-2"
+                ),
+                dcc.Download(id="download-dataframe-csv"),
+            ]),
+            html.Div(id='results-container')
+        ])
+    ], className="mt-4")
+], fluid=True)
+
+
+def process_image(contents, filename):
+    """Process a single image with Google Vision API"""
+    try:
+        client = vision.ImageAnnotatorClient()
+
+        content = contents.split(',')[1]
+        image_bytes = base64.b64decode(content)
+
+        image = vision.Image(content=image_bytes)
+
+        response = client.document_text_detection(image=image)
+
+        if response.error.message:
+            return {
+                'filename': filename,
+                'success': False,
+                'error': response.error.message
+            }
+
+        text_blocks, names = get_text_blocks(response)
+
+        # Debug print to console
+        print(f"Found names in {filename}:", names)
+
+        return {
+            'filename': filename,
+            'success': True,
+            'blocks': text_blocks,
+            'names': names
+        }
+
+    except Exception as e:
+        return {
+            'filename': filename,
+            'success': False,
+            'error': str(e)
+        }
+
+
+@app.callback(
+    [Output('processing-status', 'children'),
+     Output('results-container', 'children')],
+    Input('upload-images', 'contents'),
+    State('upload-images', 'filename')
+)
+def update_output(list_of_contents, list_of_names):
+    if list_of_contents is None:
+        return '', ''
+
+    global scan_results
+    scan_results = []
+
+    for content, name in zip(list_of_contents, list_of_names):
+        result = process_image(content, name)
+        scan_results.append(result)
+
+    status = f"Processed {len(scan_results)} files"
+
+    results_display = []
+    for result in scan_results:
+        if result['success']:
+            card = dbc.Card([
+                dbc.CardHeader(result['filename']),
+                dbc.CardBody([
+                    html.H5("Names Found:", className="mb-2"),
+                    html.P(', '.join(result['names']) if result['names'] else 'No names found',
+                           className="text-primary mb-4"),
+                    html.H5("Text Blocks:", className="mb-2"),
+                    *[html.Div(block, className="p-3 mb-2 bg-light border rounded",
+                               style={'white-space': 'pre-wrap'}) for block in result['blocks']]
+                ])
+            ], className="mb-3")
+        else:
+            card = dbc.Card([
+                dbc.CardHeader(f"Error processing {result['filename']}"),
+                dbc.CardBody([
+                    html.P(f"Error: {result['error']}", className="text-danger")
+                ])
+            ], className="mb-3")
+        results_display.append(card)
+
+    return status, results_display
+
+
+@app.callback(
+    Output("download-dataframe-csv", "data"),
+    Input("export-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def export_csv(n_clicks):
+    if not scan_results:
+        return None
+
+    # Print debug information
+    print("Preparing CSV export...")
+    for result in scan_results:
+        if result['success']:
+            print(f"File: {result['filename']}")
+            print(f"Names found: {result['names']}")
+
+    data = []
+    for result in scan_results:
+        if result['success']:
+            # Create a new row for each name found
+            for name in result['names']:
+                data.append({
+                    'File Name': result['filename'],
+                    'Name': name,
+                    'Status': 'Success'
+                })
+            # If no names found, still include the file
+            if not result['names']:
+                data.append({
+                    'File Name': result['filename'],
+                    'Name': '',
+                    'Status': 'No names found'
+                })
+        else:
+            data.append({
+                'File Name': result['filename'],
+                'Name': '',
+                'Status': f"Error: {result['error']}"
+            })
+
+    df = pd.DataFrame(data)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return dcc.send_data_frame(
+        df.to_csv,
+        f"scan_results_{timestamp}.csv",
+        index=False
+    )
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
